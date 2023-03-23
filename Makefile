@@ -2,6 +2,8 @@ APP = tinyproxy
 CC = gcc
 CFLAGS = -g
 
+LIBS = -lpthread
+
 all: $(APP)
 
 SOURCES := $(wildcard *.c)
@@ -16,4 +18,4 @@ include $(DEPEND)
 	$(CC) $(CFLAGS) $(INCS) -o $@ -c $<
 
 tinyproxy: tproxy.o
-	$(CC) $(CFLAGS) $^ -o $@
+	$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
