@@ -17,7 +17,7 @@
 #include <pthread.h>
 
 #define MAXEVENTS 1024
-#define MAXLEN 1024
+#define BUFLEN 1024
 
 bool running = true;
 
@@ -36,7 +36,7 @@ typedef struct _ProxyClient {
 
     struct sockaddr_in addr;
     socklen_t len;
-    uint8_t rcv_buf[MAXLEN];
+    uint8_t rcv_buf[BUFLEN];
     struct _ProxyTunnel *node;
 
     struct _ProxyClient *next;
@@ -50,13 +50,29 @@ typedef struct _ProxyTunnel {
     int port;
     int portlocal;
 
-    uint8_t rcv_buf[MAXLEN];
+    uint8_t rcv_buf[BUFLEN];
 
     int fd;                     /* connect to destnation's fd */
     int fdlocal;                /* bind to localport, server other client's fd */
 
     ProxyClient *clients;
-    pthread_mutex_t lock;
+
+    /*
+     * 锁用来实现对线程间内存安全访问的保障（为避免 线程A 访问 线程B 释放过的内存）
+     * tproxy 有两片内存区域需要保护：
+     * 1. ProxyTunnel
+     *    ProxyTunnel *zeta 整个连表都可能被 主线程 之 proxyDelete() 修改
+     *    ProxyTunnel *node 连表中的某个节点会被 proxyPollXxx() 多个业务线程 随即读取
+     * 2. ProxyClient
+     *    ProxyClient *clients 整个连表都可能被 proxyPollClient线程 之 clientRemove() 修改
+     *    Proxyclient *clients 在
+     *                 proxyPollServer 线程中，server 发来消息，需要读取
+     *                 proxyPollListen 线程中，新客户端建立了连接，需要修改
+     *
+     * 为此，引入两个锁： rwlock 用来处理情况1，clilock 用来处理情况2.
+     */
+    pthread_rwlock_t rwlock;
+    pthread_mutex_t clilock;
 
     struct _ProxyTunnel *next;
 } ProxyTunnel;
@@ -191,7 +207,7 @@ char* proxyAdd(ProxyTunnel *me, char *ip, int port, int portlocal, bool stream)
     ProxyTunnel *node, *tail;
     node = tail = me;
     while (node) {
-        if (node->ip && !strcmp(node->ip, ip) && node->port == port) {
+        if (node->ip && node->port == port && !strcmp(node->ip, ip)) {
             return "代理已经存在";
         }
 
@@ -220,7 +236,8 @@ char* proxyAdd(ProxyTunnel *me, char *ip, int port, int portlocal, bool stream)
     node->port = port;
     node->portlocal = portlocal;
     node->clients = NULL;
-    pthread_mutex_init(&node->lock, NULL);
+    pthread_rwlock_init(&node->rwlock, NULL);
+    pthread_mutex_init(&node->clilock, NULL);
     node->next = NULL;
 
     tail->next = node;
@@ -291,7 +308,47 @@ char* proxyAdd(ProxyTunnel *me, char *ip, int port, int portlocal, bool stream)
 
 bool proxyDelete(ProxyTunnel *me, char *ip, int port)
 {
-    return true;
+    if (!me || !ip || port == 0) return false;
+
+    pthread_rwlock_wrlock(&me->rwlock);
+    ProxyTunnel *node = me, *prev = me;
+    while (node) {
+        if (node->ip && node->port == port && !strcmp(node->ip, ip)) {
+            /* 因为我们置空了首节点，故首节点自身不会发生变化 */
+            prev->next = node->next;
+
+            free(node->ip);
+            if (node->state == TUNNEL_STATE_OK) {
+                epoll_ctl(fdserver, EPOLL_CTL_DEL, node->fd, NULL);
+                epoll_ctl(fdlisten, EPOLL_CTL_DEL, node->fdlocal, NULL);
+                close(node->fd);
+                close(node->fdlocal);
+            }
+
+            ProxyClient *client = node->clients, *clientnext = node->clients;
+            while (client) {
+                clientnext = client->next;
+
+                epoll_ctl(fdclient, EPOLL_CTL_DEL, client->fd, NULL);
+                close(client->fd);
+                client->node = NULL;
+                free(client);
+
+                client = clientnext;
+            }
+
+            free(node);
+
+            pthread_rwlock_unlock(&me->rwlock);
+            return true;
+        }
+
+        prev = node;
+        node = node->next;
+    }
+
+    pthread_rwlock_unlock(&me->rwlock);
+    return false;
 }
 
 void proxyDestroy(ProxyTunnel *me)
@@ -331,20 +388,18 @@ void serverDown(ProxyTunnel *node)
 {
     if (!node) return;
 
-    pthread_mutex_lock(&node->lock);
-
     epoll_ctl(fdserver, EPOLL_CTL_DEL, node->fd, NULL);
     close(node->fd);
     node->state = TUNNEL_STATE_NG;
 
-    pthread_mutex_unlock(&node->lock);
+    /* 没有free，此处不用加锁 */
 }
 
 void clientRemove(ProxyClient *client)
 {
     if (!client || !client->node) return;
 
-    pthread_mutex_lock(&client->node->lock);
+    pthread_mutex_lock(&client->node->clilock);
 
     ProxyClient *node = client->node->clients, *prev = client->node->clients;
 
@@ -366,15 +421,17 @@ void clientRemove(ProxyClient *client)
     client->fd = -1;
     free(client);
 
-    pthread_mutex_unlock(&client->node->lock);
+    pthread_mutex_unlock(&client->node->clilock);
 }
 
 void* proxyPollServer(void *arg)
 {
     ssize_t len = 0;
+    ProxyTunnel *zeta = (ProxyTunnel*)arg;
 
     struct epoll_event *events = calloc(MAXEVENTS, sizeof(struct epoll_event));
     while (running) {
+        pthread_rwlock_rdlock(&zeta->rwlock);
         int n = epoll_wait(fdserver, events, MAXEVENTS, 2000);
 
         for (int i = 0; i < n; i++) {
@@ -389,19 +446,19 @@ void* proxyPollServer(void *arg)
                 continue;
             }
 
-            while ((len = recv(node->fd, node->rcv_buf, MAXLEN, 0)) > 0) {
+            while ((len = recv(node->fd, node->rcv_buf, BUFLEN, 0)) > 0) {
                 TPROXY_LOG("On receive %s %d %zu bytes", node->ip, node->port, len);
                 /*
                  * 消息下行：发给所有客户端
                  */
-                pthread_mutex_lock(&node->lock);
+                pthread_mutex_lock(&node->clilock);
                 ProxyClient *client = node->clients;
                 while (client) {
                     _sendTo(client->fd, node->rcv_buf, len);
 
                     client = client->next;
                 }
-                pthread_mutex_unlock(&node->lock);
+                pthread_mutex_unlock(&node->clilock);
             }
             if (len == 0) {
                 TPROXY_LOG("On close %s %d", node->ip, node->port);
@@ -414,6 +471,7 @@ void* proxyPollServer(void *arg)
                 continue;
             }
         }
+        pthread_rwlock_unlock(&zeta->rwlock);
     }
 
     free(events);
@@ -424,9 +482,11 @@ void* proxyPollServer(void *arg)
 void* proxyPollClient(void *arg)
 {
     ssize_t len = 0;
+    ProxyTunnel *zeta = (ProxyTunnel*)arg;
 
     struct epoll_event *events = calloc(MAXEVENTS, sizeof(struct epoll_event));
     while (running) {
+        pthread_rwlock_rdlock(&zeta->rwlock);
         int n = epoll_wait(fdclient, events, MAXEVENTS, 2000);
 
         for (int i = 0; i < n; i++) {
@@ -441,15 +501,13 @@ void* proxyPollClient(void *arg)
                 continue;
             }
 
-            while ((len = recv(client->fd, client->rcv_buf, MAXLEN, 0)) > 0) {
+            while ((len = recv(client->fd, client->rcv_buf, BUFLEN, 0)) > 0) {
                 TPROXY_LOG("On receive lo:%d %zu bytes", client->node->portlocal, len);
 
                 /*
                  * 消息上行：回发给服务器
                  */
-                pthread_mutex_lock(&client->node->lock);
                 _sendTo(client->node->fd, client->rcv_buf, len);
-                pthread_mutex_unlock(&client->node->lock);
             }
             if (len == 0) {
                 TPROXY_LOG("On close lo:%d", client->node->portlocal);
@@ -462,6 +520,7 @@ void* proxyPollClient(void *arg)
                 continue;
             }
         }
+        pthread_rwlock_unlock(&zeta->rwlock);
     }
 
     free(events);
@@ -472,7 +531,10 @@ void* proxyPollClient(void *arg)
 void* proxyPollListen(void *arg)
 {
     struct epoll_event *events = calloc(MAXEVENTS, sizeof(struct epoll_event));
+    ProxyTunnel *zeta = (ProxyTunnel*)arg;
+
     while (running) {
+        pthread_rwlock_rdlock(&zeta->rwlock);
         int n = epoll_wait(fdlisten, events, MAXEVENTS, 2000);
 
         for (int i = 0; i < n; i++) {
@@ -489,10 +551,10 @@ void* proxyPollListen(void *arg)
 
             TPROXY_LOG("On accept lo:%d", node->portlocal);
 
-            pthread_mutex_lock(&node->lock);
+            pthread_mutex_lock(&node->clilock);
             client->next = node->clients;
             node->clients = client;
-            pthread_mutex_unlock(&node->lock);
+            pthread_mutex_unlock(&node->clilock);
 
             fcntl(client->fd, F_SETFL, fcntl(client->fd, F_GETFL, 0) | O_NONBLOCK);
             int optval = 1;
@@ -506,6 +568,7 @@ void* proxyPollListen(void *arg)
                 free(client);
             }
         }
+        pthread_rwlock_unlock(&zeta->rwlock);
     }
 
     free(events);
@@ -546,6 +609,8 @@ int main(int argc, char *argv[])
     }
     memset(zeta, 0x0, sizeof(ProxyTunnel));
     zeta->ip = strdup("nobody");
+    pthread_rwlock_init(&zeta->rwlock, NULL);
+    pthread_mutex_init(&zeta->clilock, NULL);
 
     fdserver = epoll_create1(0);
     fdclient = epoll_create1(0);
@@ -580,7 +645,7 @@ int main(int argc, char *argv[])
 
             break;
         default:
-            useage(argv[1]);
+            useage(argv[0]);
         }
     }
 
@@ -589,12 +654,14 @@ int main(int argc, char *argv[])
     running = true;
 
     pthread_t workera, workerb, workerc;
-    pthread_create(&workera, NULL, proxyPollServer, NULL);
-    pthread_create(&workerb, NULL, proxyPollClient, NULL);
-    pthread_create(&workerc, NULL, proxyPollListen, NULL);
+    pthread_create(&workera, NULL, proxyPollServer, zeta);
+    pthread_create(&workerb, NULL, proxyPollClient, zeta);
+    pthread_create(&workerc, NULL, proxyPollListen, zeta);
 
     while (running) {
+        //proxyAdd(zeta, "172.16.1.82", 7778, 3001, true);
         sleep(1);
+        //proxyDelete(zeta, "172.16.1.82", 7778);
     }
 
     pthread_join(workera, NULL);
