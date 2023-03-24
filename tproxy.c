@@ -8,6 +8,7 @@
 #include <signal.h>
 #include <sys/epoll.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -16,6 +17,11 @@
 #include <ctype.h>
 #include <pthread.h>
 
+/*
+ * gcc -g tproxy.c -o tinyproxy -lpthread
+ */
+
+#define PIPE_NAME "/tmp/tproxypipe"
 #define MAXEVENTS 1024
 #define BUFLEN 1024
 
@@ -77,6 +83,8 @@ typedef struct _ProxyTunnel {
     struct _ProxyTunnel *next;
 } ProxyTunnel;
 
+ProxyTunnel *zeta = NULL;
+
 #define TPROXY_LOG(fmt, ...)                                            \
     do {                                                                \
         char _timestr[25] = {0};                                        \
@@ -99,9 +107,9 @@ void useage(char *app)
     exit(1);
 }
 
-size_t _sendTo(int fd, uint8_t *buf, size_t count)
+ssize_t _sendTo(int fd, uint8_t *buf, size_t count)
 {
-    size_t rv, c;
+    ssize_t rv, c;
     c = 0;
     while (c < count) {
         rv = send(fd, buf + c, count - c, MSG_NOSIGNAL);
@@ -195,14 +203,48 @@ void proxyOver(int sig)
     running = false;
 }
 
-pid_t proxyProcessFind(char *app)
+pid_t findMyself(char *app)
 {
-    return 0;
+    if (!app) return 0;
+
+    char *appname = strrchr(app, '/');
+    if (!appname) appname = app;
+    else appname++;
+
+    if (!appname || !*appname) return 0;
+
+    pid_t pid = 0, mypid = getpid();
+
+    char command[256];
+    snprintf(command, sizeof(command), "pidof %s", appname);
+    FILE *fp = popen(command, "r");
+    if (fp) {
+        char output[256] = {0};
+        /*
+         * ml@miivii-tegra:~$ pidof tinyproxy
+         * 16356 15658
+         */
+        if (fgets(output, sizeof(output) - 1, fp) != NULL) {
+            char *tok = output;
+            while (*tok) {
+                if (atoi(tok) != mypid) {
+                    pid = atoi(tok);
+                    break;
+                }
+                tok++;
+                while (isdigit(*tok)) tok++;
+                while (isblank(*tok)) tok++;
+            }
+        }
+        pclose(fp);
+    }
+
+    return pid;
 }
 
 char* proxyAdd(ProxyTunnel *me, char *ip, int port, int portlocal, bool stream)
 {
-    //TPROXY_LOG("ADD %s %d %d %d", ip, port, portlocal, stream);
+    TPROXY_LOG("ADD %s %d %d %d", ip, port, portlocal, stream);
 
     ProxyTunnel *node, *tail;
     node = tail = me;
@@ -310,6 +352,8 @@ bool proxyDelete(ProxyTunnel *me, char *ip, int port)
 {
     if (!me || !ip || port == 0) return false;
 
+    TPROXY_LOG("Delete tunnel %s %d", ip, port);
+
     pthread_rwlock_wrlock(&me->rwlock);
     ProxyTunnel *node = me, *prev = me;
     while (node) {
@@ -384,6 +428,68 @@ void proxyDestroy(ProxyTunnel *me)
     }
 }
 
+/* message content sample:
+ * -d
+ * wo ri ni da ye
+ * -t
+ * xxx yyy sdfsd sdfdf
+ */
+void proxyOnMessage(int sig, siginfo_t *si, void *ucontext)
+{
+    char *ip = NULL;
+    int port, portlocal;
+    char *errmsg;
+
+    int argc = si->si_value.sival_int;
+
+    int rv = mkfifo(PIPE_NAME, 0666);
+    if (rv < 0 && errno != EEXIST) {
+        TPROXY_LOG("mkfifo %s", strerror(errno));
+        return;
+    }
+
+    int fd = open(PIPE_NAME, O_RDONLY);
+    if (fd < 0) {
+        TPROXY_LOG("open %s %s", PIPE_NAME, strerror(errno));
+        return;
+    }
+
+    char buf[1024];
+    ssize_t len = read(fd, buf, sizeof(buf));
+    if (len <= 0) {
+        TPROXY_LOG("read %s", strerror(errno));
+    }
+    close(fd);
+
+    //TPROXY_LOG("On message %s", buf);
+
+    char *p = buf, *q = buf, *r = buf;
+    while ((q = strchr(p, '\n')) != NULL && (r = strchr(q+1, '\n')) != NULL && p - buf < len) {
+        *q = '\0';
+        *r = '\0';
+        char *command = p;
+        char *argument = q + 1;
+
+        if (!strcmp(command, "-t")) {
+            if (parseArgument3(argument, &ip, &port, &portlocal)) {
+                errmsg = proxyAdd(zeta, ip, port, portlocal, true);
+                if (errmsg) TPROXY_LOG("Add tunnel %s %d %d : %s", ip, port, portlocal, errmsg);
+            } else TPROXY_LOG("%s format error", argument);
+        } else if (!strcmp(command, "-u")) {
+            if (parseArgument3(argument, &ip, &port, &portlocal)) {
+                errmsg = proxyAdd(zeta, ip, port, portlocal, false);
+                if (errmsg) TPROXY_LOG("Add tunnel %s %d %d : %s", ip, port, portlocal, errmsg);
+            } else TPROXY_LOG("%s format error", argument);
+        } else if (!strcmp(command, "-d")) {
+            if (parseArgument2(argument, &ip, &port)) {
+                if (!proxyDelete(zeta, ip, port)) TPROXY_LOG("tunnel %s %d don't exist", ip, port);
+            } else TPROXY_LOG("%s format error", argument);
+        } else TPROXY_LOG("unkown command %s %s", command, argument);
+
+        p = r + 1;
+    }
+}
+
 void serverDown(ProxyTunnel *node)
 {
     if (!node) return;
@@ -427,13 +533,13 @@ void clientRemove(ProxyClient *client)
 void* proxyPollServer(void *arg)
 {
     ssize_t len = 0;
-    ProxyTunnel *zeta = (ProxyTunnel*)arg;
+    ProxyTunnel *site = (ProxyTunnel*)arg;
 
     struct epoll_event *events = calloc(MAXEVENTS, sizeof(struct epoll_event));
     while (running) {
-        pthread_rwlock_rdlock(&zeta->rwlock);
         int n = epoll_wait(fdserver, events, MAXEVENTS, 2000);
 
+        pthread_rwlock_rdlock(&site->rwlock);
         for (int i = 0; i < n; i++) {
             ProxyTunnel *node = (ProxyTunnel*)events[i].data.ptr;
 
@@ -471,7 +577,7 @@ void* proxyPollServer(void *arg)
                 continue;
             }
         }
-        pthread_rwlock_unlock(&zeta->rwlock);
+        pthread_rwlock_unlock(&site->rwlock);
     }
 
     free(events);
@@ -482,13 +588,13 @@ void* proxyPollServer(void *arg)
 void* proxyPollClient(void *arg)
 {
     ssize_t len = 0;
-    ProxyTunnel *zeta = (ProxyTunnel*)arg;
+    ProxyTunnel *site = (ProxyTunnel*)arg;
 
     struct epoll_event *events = calloc(MAXEVENTS, sizeof(struct epoll_event));
     while (running) {
-        pthread_rwlock_rdlock(&zeta->rwlock);
         int n = epoll_wait(fdclient, events, MAXEVENTS, 2000);
 
+        pthread_rwlock_rdlock(&site->rwlock);
         for (int i = 0; i < n; i++) {
             ProxyClient *client = (ProxyClient*)events[i].data.ptr;
 
@@ -520,7 +626,7 @@ void* proxyPollClient(void *arg)
                 continue;
             }
         }
-        pthread_rwlock_unlock(&zeta->rwlock);
+        pthread_rwlock_unlock(&site->rwlock);
     }
 
     free(events);
@@ -531,12 +637,12 @@ void* proxyPollClient(void *arg)
 void* proxyPollListen(void *arg)
 {
     struct epoll_event *events = calloc(MAXEVENTS, sizeof(struct epoll_event));
-    ProxyTunnel *zeta = (ProxyTunnel*)arg;
+    ProxyTunnel *site = (ProxyTunnel*)arg;
 
     while (running) {
-        pthread_rwlock_rdlock(&zeta->rwlock);
         int n = epoll_wait(fdlisten, events, MAXEVENTS, 2000);
 
+        pthread_rwlock_rdlock(&site->rwlock);
         for (int i = 0; i < n; i++) {
             ProxyTunnel *node = (ProxyTunnel*)events[i].data.ptr;
 
@@ -568,7 +674,7 @@ void* proxyPollListen(void *arg)
                 free(client);
             }
         }
-        pthread_rwlock_unlock(&zeta->rwlock);
+        pthread_rwlock_unlock(&site->rwlock);
     }
 
     free(events);
@@ -585,24 +691,66 @@ int main(int argc, char *argv[])
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, proxyOver);
 
-    pid_t pid = proxyProcessFind(argv[0]);
+    struct sigaction sa;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_sigaction = proxyOnMessage;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGUSR1, &sa, NULL);
+
+    pid_t pid = findMyself(argv[0]);
     if (pid > 0) {
         /* 系统中有这个进程在跑了，发消息给他就行 */
+        TPROXY_LOG("%s already exist with pid %d, notify it", argv[0], pid);
+
+        union sigval sv;
+        //sv.sival_ptr = "fuck u baby!";
+        sv.sival_int = argc;
+        sigqueue(pid, SIGUSR1, sv);
+
+        int rv = mkfifo(PIPE_NAME, 0666);
+        if (rv < 0 && errno != EEXIST) {
+            TPROXY_LOG("mkfifo %s", strerror(errno));
+            return 1;
+        }
+
+        int fd = open(PIPE_NAME, O_WRONLY);
+        if (fd < 0) {
+            TPROXY_LOG("open %s %s", PIPE_NAME, strerror(errno));
+            return 1;
+        }
+
+        char buf[1024] = {0};
+        size_t len = 0;
+        int idx = 1;
+        while (idx < argc && len < (sizeof(buf) - strlen(argv[idx]) - 1)) {
+            int arglen = strlen(argv[idx]);
+
+            strcat(buf + len, argv[idx]);
+            strcat(buf + len + arglen, "\n");
+
+            len += arglen;
+            len += 1;
+
+            idx++;
+        }
+        write(fd, buf, len);
+        close(fd);
+
         return 0;
     } else {
         /* 还没有这个进程，后台运行 */
-        //pid = fork();
-        //if (pid > 0) return 0;
-        //else if (pid < 0) {
-        //    perror("Error in fork");
-        //    return 1;
-        //}
-        //close(0);
-        //setsid();
+        pid = fork();
+        if (pid > 0) return 0;
+        else if (pid < 0) {
+            perror("Error in fork");
+            return 1;
+        }
+        close(0);
+        setsid();
     }
 
     /* 冗余第一个节点，不干任何事情 */
-    ProxyTunnel *zeta = calloc(1, sizeof(ProxyTunnel));
+    zeta = calloc(1, sizeof(ProxyTunnel));
     if (!zeta) {
         perror("memory over!");
         return 1;
