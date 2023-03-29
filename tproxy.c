@@ -329,7 +329,8 @@ char* proxyAdd(ProxyTunnel *me, char *ip, int port, int portlocal, bool stream)
     rv = bind(node->fdlocal, (struct sockaddr*)&srvsa, sizeof(srvsa));
     if (rv < 0) RETURN("绑定本地端口失败");
 
-    if (listen(node->fdlocal, 1024) < 0) RETURN("监听本地端口失败");
+    if (stream && listen(node->fdlocal, 1024) < 0) RETURN("监听本地端口失败");
+    else fcntl(node->fdlocal, F_SETFL, fcntl(node->fdlocal, F_GETFL, 0) | O_NONBLOCK);
 
     struct epoll_event eventb;
     eventb.data.ptr = node;
@@ -373,8 +374,10 @@ bool proxyDelete(ProxyTunnel *me, char *ip, int port)
             while (client) {
                 clientnext = client->next;
 
-                epoll_ctl(fdclient, EPOLL_CTL_DEL, client->fd, NULL);
-                close(client->fd);
+                if (node->stream) {
+                    epoll_ctl(fdclient, EPOLL_CTL_DEL, client->fd, NULL);
+                    close(client->fd);
+                }
                 client->node = NULL;
                 free(client);
 
@@ -414,8 +417,10 @@ void proxyDestroy(ProxyTunnel *me)
         while (client) {
             clientnext = client->next;
 
-            epoll_ctl(fdclient, EPOLL_CTL_DEL, client->fd, NULL);
-            close(client->fd);
+            if (node->stream) {
+                epoll_ctl(fdclient, EPOLL_CTL_DEL, client->fd, NULL);
+                close(client->fd);
+            }
             client->node = NULL;
             free(client);
 
@@ -522,8 +527,10 @@ void clientRemove(ProxyClient *client)
     if (node == client->node->clients) client->node->clients = node->next;
     prev->next = node->next;
 
-    epoll_ctl(fdclient, EPOLL_CTL_DEL, client->fd, NULL);
-    close(client->fd);
+    if (client->node->stream) {
+        epoll_ctl(fdclient, EPOLL_CTL_DEL, client->fd, NULL);
+        close(client->fd);
+    }
     client->fd = -1;
     free(client);
 
@@ -560,7 +567,12 @@ void* proxyPollServer(void *arg)
                 pthread_mutex_lock(&node->clilock);
                 ProxyClient *client = node->clients;
                 while (client) {
-                    _sendTo(client->fd, node->rcv_buf, len);
+                    if (node->stream) _sendTo(client->fd, node->rcv_buf, len);
+                    else {
+                        sendto(client->fd, node->rcv_buf, len, 0,
+                               (struct sockaddr*)&client->addr, client->len);
+                        /* TODO 怎样检测已关闭的 UDP client? */
+                    }
 
                     client = client->next;
                 }
@@ -638,6 +650,7 @@ void* proxyPollListen(void *arg)
 {
     struct epoll_event *events = calloc(MAXEVENTS, sizeof(struct epoll_event));
     ProxyTunnel *site = (ProxyTunnel*)arg;
+    ssize_t len = 0;
 
     while (running) {
         int n = epoll_wait(fdlisten, events, MAXEVENTS, 2000);
@@ -646,32 +659,79 @@ void* proxyPollListen(void *arg)
         for (int i = 0; i < n; i++) {
             ProxyTunnel *node = (ProxyTunnel*)events[i].data.ptr;
 
-            ProxyClient *client = calloc(1, sizeof(ProxyClient));
-            client->node = node;
-            client->fd = accept(node->fdlocal, (struct sockaddr*)&(client->addr), &(client->len));
-            if (client->fd < 0) {
-                TPROXY_LOG("accept lo:%d %s", node->portlocal, strerror(errno));
-                free(client);
-                continue;
-            }
+            if (node->stream) {
+                /* TCP 连接，需要先建立连接 */
+                ProxyClient *client = calloc(1, sizeof(ProxyClient));
+                client->node = node;
+                client->fd = accept(node->fdlocal, (struct sockaddr*)&(client->addr), &(client->len));
+                if (client->fd < 0) {
+                    TPROXY_LOG("accept lo:%d %s", node->portlocal, strerror(errno));
+                    free(client);
+                    continue;
+                }
 
-            TPROXY_LOG("On accept lo:%d", node->portlocal);
+                TPROXY_LOG("On accept lo:%d", node->portlocal);
 
-            pthread_mutex_lock(&node->clilock);
-            client->next = node->clients;
-            node->clients = client;
-            pthread_mutex_unlock(&node->clilock);
+                pthread_mutex_lock(&node->clilock);
+                client->next = node->clients;
+                node->clients = client;
+                pthread_mutex_unlock(&node->clilock);
 
-            fcntl(client->fd, F_SETFL, fcntl(client->fd, F_GETFL, 0) | O_NONBLOCK);
-            int optval = 1;
-            setsockopt(client->fd, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval));
+                fcntl(client->fd, F_SETFL, fcntl(client->fd, F_GETFL, 0) | O_NONBLOCK);
+                int optval = 1;
+                setsockopt(client->fd, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval));
 
-            struct epoll_event event;
-            event.data.ptr = client;
-            event.events = EPOLLIN | EPOLLET;
-            if (epoll_ctl(fdclient, EPOLL_CTL_ADD, client->fd, &event) < 0) {
-                TPROXY_LOG("epoll lo:%d %s", node->portlocal, strerror(errno));
-                free(client);
+                struct epoll_event event;
+                event.data.ptr = client;
+                event.events = EPOLLIN | EPOLLET;
+                if (epoll_ctl(fdclient, EPOLL_CTL_ADD, client->fd, &event) < 0) {
+                    TPROXY_LOG("epoll lo:%d %s", node->portlocal, strerror(errno));
+                    free(client);
+                }
+            } else {
+                /* UDP 连接，直接上行消息，并保存客户端信息，方便消息下行 */
+                uint8_t rcv_buf[BUFLEN];
+                struct sockaddr_in clisa;
+                socklen_t clilen;
+                while ((len = recvfrom(node->fdlocal, rcv_buf, BUFLEN, 0,
+                                       (struct sockaddr*)&clisa, &clilen)) > 0) {
+                    TPROXY_LOG("On receive %s:%d %zu bytes",
+                               inet_ntoa(clisa.sin_addr), ntohs(clisa.sin_port),
+                               len);
+
+                    /*
+                     * 消息上行：回发给服务器
+                     */
+                    _sendTo(node->fd, rcv_buf, len);
+
+                    /* TODO why the first udp packet has no client addr information? */
+                    if (clisa.sin_addr.s_addr == 0) continue;
+
+                    ProxyClient *client = node->clients;
+                    while (client) {
+                        if (client->len == clilen &&
+                            !memcmp(&client->addr, &clisa, sizeof(struct sockaddr_in))) {
+                            break;
+                        }
+                        client = client->next;
+                    }
+
+                    if (!client) {
+                        TPROXY_LOG("On new client lo:%d", node->portlocal);
+
+                        client = calloc(1, sizeof(ProxyClient));
+                        client->node = node;
+                        client->fd = node->fdlocal;
+                        memcpy(&client->addr, &clisa, sizeof(struct sockaddr_in));
+                        client->len = clilen;
+
+                        pthread_mutex_lock(&node->clilock);
+                        client->next = node->clients;
+                        node->clients = client;
+                        pthread_mutex_unlock(&node->clilock);
+                    }
+                }
+
             }
         }
         pthread_rwlock_unlock(&site->rwlock);
@@ -738,15 +798,28 @@ int main(int argc, char *argv[])
 
         return 0;
     } else {
-        /* 还没有这个进程，后台运行 */
-        pid = fork();
-        if (pid > 0) return 0;
-        else if (pid < 0) {
-            perror("Error in fork");
-            return 1;
+        bool daemon = true;
+
+        int idx = 1;
+        while (idx < argc) {
+            if (argv[idx][0] == '-' && argv[idx][1] == 'f') {
+                daemon = false;
+                break;
+            }
+
+            idx++;
         }
-        close(0);
-        setsid();
+
+        if (daemon) {
+            pid = fork();
+            if (pid > 0) return 0;
+            else if (pid < 0) {
+                perror("Error in fork");
+                return 1;
+            }
+            close(0);
+            setsid();
+        }
     }
 
     /* 冗余第一个节点，不干任何事情 */
@@ -769,7 +842,7 @@ int main(int argc, char *argv[])
     }
 
     int c;
-    while ((c = getopt(argc, argv, "t:u:d:")) != -1) {
+    while ((c = getopt(argc, argv, "t:u:d:f")) != -1) {
         switch (c) {
         case 't':
             if (parseArgument3(optarg, &ip, &port, &portlocal)) {
@@ -791,6 +864,8 @@ int main(int argc, char *argv[])
                     TPROXY_LOG("tunnel %s %d don't exist", ip, port);
             } else TPROXY_LOG("%s format error", optarg);
 
+            break;
+        case 'f':
             break;
         default:
             useage(argv[0]);
